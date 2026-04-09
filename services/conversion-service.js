@@ -1,8 +1,11 @@
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
+const { randomUUID } = require('crypto');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const execFileAsync = promisify(execFile);
 
@@ -21,6 +24,24 @@ const SUPPORTED_TARGETS = {
   jpeg: ['png', 'pdf'],
   png: ['jpg', 'pdf'],
 };
+
+function createS3Client() {
+  return new S3Client({
+    region: process.env.AWS_REGION,
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY || process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_KEY || process.env.AWS_SECRET_ACCESS_KEY,
+    },
+  });
+}
+
+function getBucketName() {
+  return (
+    process.env.AWS_S3_BUCKET ||
+    process.env.S3_BUCKET_NAME ||
+    'aws-file-converter-ho-hoang-duy'
+  );
+}
 
 function createHttpError(statusCode, message) {
   const error = new Error(message);
@@ -45,6 +66,58 @@ function getFileExtension(fileName) {
 
 function getAllowedTargetFormats(extension) {
   return SUPPORTED_TARGETS[normalizeExtension(extension)] || [];
+}
+
+function buildOutputFileName(fileName, targetFormat) {
+  const outputBaseName = sanitizeBaseName(fileName);
+  return `${outputBaseName}-${randomUUID()}.${targetFormat}`;
+}
+
+async function getDownloadUrl(fileName) {
+  const s3Client = createS3Client();
+  const s3Object = new GetObjectCommand({
+    Bucket: getBucketName(),
+    Key: `originals/${fileName}`,
+  });
+
+  const url = await getSignedUrl(s3Client, s3Object, { expiresIn: 3600 });
+  console.log('Generated download URL:', url);
+  return url;
+}
+
+async function getUploadUrl(fileName, contentType) {
+  const s3Client = createS3Client();
+  const key = `originals/${fileName}`;
+  const s3Object = new PutObjectCommand({
+    Bucket: getBucketName(),
+    Key: key,
+    ContentType: contentType,
+  });
+
+  const uploadUrl = await getSignedUrl(s3Client, s3Object, { expiresIn: 3600 });
+  console.log('Generated upload URL:', uploadUrl);
+
+  return {
+    uploadUrl,
+    key,
+  };
+}
+
+async function uploadConvertedFile(buffer, outputFileName, contentType) {
+  const convertedKey = `converted/${outputFileName}`;
+  const s3Client = createS3Client();
+
+  await s3Client.send(
+    new PutObjectCommand({
+      Bucket: getBucketName(),
+      Key: convertedKey,
+      Body: buffer,
+      ContentType: contentType,
+    }),
+  );
+
+  console.log('Uploaded converted file to S3:', convertedKey);
+  return convertedKey;
 }
 
 async function runCommand(command, args) {
@@ -104,7 +177,6 @@ async function convertFile({ fileName, fileContents, outputFormat }) {
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'file-converter-'));
   const inputPath = path.join(tempDir, `source.${sourceFormat}`);
-  const outputBaseName = sanitizeBaseName(fileName);
 
   try {
     await fs.writeFile(inputPath, Buffer.from(fileContents, 'base64'));
@@ -121,11 +193,18 @@ async function convertFile({ fileName, fileContents, outputFormat }) {
     }
 
     const buffer = await fs.readFile(outputPath);
+    const outputFileName = buildOutputFileName(fileName, targetFormat);
+    const uploadedKey = await uploadConvertedFile(
+      buffer,
+      outputFileName,
+      MIME_TYPES[targetFormat],
+    );
 
     return {
       buffer,
       mimeType: MIME_TYPES[targetFormat],
-      outputFileName: `${outputBaseName}.${targetFormat}`,
+      outputFileName,
+      uploadedKey,
     };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -135,4 +214,6 @@ async function convertFile({ fileName, fileContents, outputFormat }) {
 module.exports = {
   convertFile,
   getAllowedTargetFormats,
+  getDownloadUrl,
+  getUploadUrl,
 };
